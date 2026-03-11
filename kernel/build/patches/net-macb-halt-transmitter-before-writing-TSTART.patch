@@ -1,0 +1,137 @@
+From 4e398d15e8b4fa8cfd087487b574556d80a732ed Mon Sep 17 00:00:00 2001
+From: Mark Feldhousen <markf@geekpad.com>
+Date: Fri, 13 Mar 2026 15:30:44 -0400
+Subject: [PATCH] net: macb: halt transmitter before writing TSTART in
+ macb_tx_restart()
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+On some GEM variants the write to the TSTART bit
+in NCR is silently discarded when the transmitter
+is already active (TGO set in TSR). When this
+occurs, newly submitted TX descriptors are never
+fetched, no TCOMP interrupt fires, and the TX ring
+enters a permanent deadlock: macb_interrupt
+continues firing for RX only while the TX ring
+stalls indefinitely until the TX watchdog resets
+the hardware.
+
+Confirmed by ftrace on a Raspberry Pi 5 (RP1 GEM)
+running Linux 6.18.16 under sustained iperf3 UDP
+load: macb_tx_poll found zero completions 38us
+after macb_start_xmit submitted descriptors and
+wrote TSTART. From that point macb_interrupt fired
+for RX only; TCOMP was never generated again until
+ip link set down/up.
+
+Fix in three parts:
+
+1. In macb_start_xmit(), set txubr_pending when
+   TSTART is written while TGO is already set in
+   TSR. This marks the queue as needing a TX
+   restart once the current transmission
+   completes.
+
+2. In macb_interrupt(), when TCOMP fires without
+   TXUBR, clear txubr_pending — TX is completing
+   normally and no recovery is needed. When an
+   interrupt arrives without TCOMP while
+   txubr_pending is set, schedule napi_tx as a
+   wakeup trigger. This discriminates a genuine
+   stall (TCOMP never fires) from normal
+   high-throughput operation (TCOMP fires
+   continuously), avoiding spurious calls to
+   macb_tx_restart() while the transmitter is
+   legitimately active.
+
+3. In macb_tx_restart(), halt the transmitter
+   before writing TSTART if TGO is set in TSR.
+   Parts 1 and 2 arrange for macb_tx_restart() to
+   be called when a stuck queue is detected, but
+   writing TSTART into an active transmitter on
+   affected hardware will be dropped again.
+   Halting first ensures the write takes effect.
+   This is correct behavior on all platforms:
+   macb_tx_restart() is an infrequent recovery
+   path and halting before restarting is safe by
+   construction.
+
+Link:
+https://bugs.launchpad.net/ubuntu/+source/linux-raspi/+bug/2133877
+Signed-off-by: Mark Feldhousen <markf@geekpad.com>
+---
+ drivers/net/ethernet/cadence/macb_main.c | 36 ++++++++++++++++++++++++
+ 1 file changed, 36 insertions(+)
+
+diff --git a/drivers/net/ethernet/cadence/macb_main.c b/drivers/net/ethernet/cadence/macb_main.c
+index 90550055c..025db8849 100644
+--- a/drivers/net/ethernet/cadence/macb_main.c
++++ b/drivers/net/ethernet/cadence/macb_main.c
+@@ -1713,6 +1713,17 @@ static void macb_tx_restart(struct macb_queue *queue)
+ 		goto out_tx_ptr_unlock;
+ 
+ 	spin_lock(&bp->lock);
++	/* Ensure the transmitter is idle before writing TSTART. On some
++	 * GEM variants, a TSTART write to NCR is silently discarded when the
++	 * transmitter is already active (TGO set in TSR). Halting first
++	 * guarantees the write takes effect regardless of hardware state.
++	 */
++	if (macb_readl(bp, TSR) & MACB_BIT(TGO)) {
++		if (macb_halt_tx(bp))
++			netdev_warn(bp->dev,
++				    "TX halt timed out; TSTART write may be dropped\n");
++		macb_writel(bp, NCR, macb_readl(bp, NCR) & ~MACB_BIT(THALT));
++	}
+ 	macb_writel(bp, NCR, macb_readl(bp, NCR) | MACB_BIT(TSTART));
+ 	spin_unlock(&bp->lock);
+ 
+@@ -1931,6 +1942,11 @@ static irqreturn_t macb_interrupt(int irq, void *dev_id)
+ 			if (status & MACB_BIT(TXUBR)) {
+ 				queue->txubr_pending = true;
+ 				wmb(); // ensure softirq can see update
++			} else {
++			/* TCOMP without TXUBR: TX completing normally,
++			 * cancel any pending stall recovery.
++			 */
++			queue->txubr_pending = false;
+ 			}
+ 
+ 			if (napi_schedule_prep(&queue->napi_tx)) {
+@@ -1939,6 +1955,18 @@ static irqreturn_t macb_interrupt(int irq, void *dev_id)
+ 			}
+ 		}
+ 
++		/* Recovery: txubr_pending was set in macb_start_xmit when TGO
++		 * was active. If TSTART was silently dropped on some GEM variants,
++		 * TCOMP never fires. Use any non-TCOMP interrupt (e.g. RCOMP) as
++		 * the wakeup trigger to call macb_tx_restart().
++		 */
++		if (!(status & MACB_BIT(TCOMP)) &&
++		    queue->txubr_pending &&
++		    napi_schedule_prep(&queue->napi_tx)) {
++			netdev_vdbg(bp->dev, "scheduling TX softirq (stall recovery)\n");
++			__napi_schedule(&queue->napi_tx);
++		}
++
+ 		if (unlikely(status & (MACB_TX_ERR_FLAGS))) {
+ 			queue_writel(queue, IDR, MACB_TX_INT_FLAGS);
+ 			schedule_work(&queue->tx_error_task);
+@@ -2387,6 +2415,14 @@ static netdev_tx_t macb_start_xmit(struct sk_buff *skb, struct net_device *dev)
+ 			     skb->len);
+ 
+ 	spin_lock(&bp->lock);
++
++	/* On some GEM variants, a TSTART write may be silently dropped when the
++	 * transmitter is already active (TGO set in TSR). Mark txubr_pending so
++	 * the next TX completion IRQ triggers macb_tx_restart() to re-arm TX,
++	 * breaking the resulting deadlock where the ring never drains.
++	 */
++	if (macb_readl(bp, TSR) & MACB_BIT(TGO))
++		queue->txubr_pending = true;
+ 	macb_writel(bp, NCR, macb_readl(bp, NCR) | MACB_BIT(TSTART));
+ 	spin_unlock(&bp->lock);
+ 
+-- 
+2.53.0
+
